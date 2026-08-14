@@ -4,13 +4,95 @@ import glob
 import json
 import subprocess
 import threading
-from flask import Flask, request, jsonify, send_file, render_template
+import hmac
+import time
+from flask import Flask, request, jsonify, send_file, render_template, Response
 
 app = Flask(__name__)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+AUTH_USER = os.environ.get("RECLIP_USER", "")
+AUTH_PASSWORD = os.environ.get("RECLIP_PASSWORD", "")
+
+try:
+    DOWNLOAD_TTL_SECONDS = int(os.environ.get("RECLIP_DOWNLOAD_TTL_SECONDS", "3600"))
+except ValueError:
+    DOWNLOAD_TTL_SECONDS = 3600
+
+if DOWNLOAD_TTL_SECONDS <= 0:
+    DOWNLOAD_TTL_SECONDS = 3600
+
 jobs = {}
+
+
+@app.before_request
+def require_auth():
+    if request.path == "/health":
+        return None
+
+    if not AUTH_USER or not AUTH_PASSWORD:
+        return Response(
+            "RECLIP_USER and RECLIP_PASSWORD are not configured",
+            status=503,
+        )
+
+    auth = request.authorization
+
+    valid = (
+        auth is not None
+        and hmac.compare_digest(auth.username or "", AUTH_USER)
+        and hmac.compare_digest(auth.password or "", AUTH_PASSWORD)
+    )
+
+    if not valid:
+        return Response(
+            "Authentication required",
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="ReClip", charset="UTF-8"'},
+        )
+
+    return None
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    if not AUTH_USER or not AUTH_PASSWORD:
+        return jsonify({"status": "error", "reason": "auth_not_configured"}), 503
+
+    return jsonify({"status": "ok"}), 200
+
+
+def cleanup_expired_downloads():
+    cutoff = time.time() - DOWNLOAD_TTL_SECONDS
+
+    for path in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+    expired_job_ids = []
+
+    for job_id, job in list(jobs.items()):
+        created_at = job.get("created_at")
+        status = job.get("status")
+
+        if created_at and created_at < cutoff and status in {"done", "error"}:
+            file_path = job.get("file")
+
+            if file_path:
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                except OSError:
+                    pass
+
+            expired_job_ids.append(job_id)
+
+    for job_id in expired_job_ids:
+        jobs.pop(job_id, None)
 
 
 def parse_ytdlp_json(stdout):
@@ -96,7 +178,7 @@ def index():
 
 @app.route("/api/info", methods=["POST"])
 def get_info():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -142,7 +224,7 @@ def get_info():
 
 @app.route("/api/playlist", methods=["POST"])
 def get_playlist_info():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -165,7 +247,9 @@ def get_playlist_info():
 
 @app.route("/api/download", methods=["POST"])
 def start_download():
-    data = request.json
+    cleanup_expired_downloads()
+
+    data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
@@ -175,7 +259,12 @@ def start_download():
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    jobs[job_id] = {
+        "status": "downloading",
+        "url": url,
+        "title": title,
+        "created_at": time.time(),
+    }
 
     thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
@@ -198,6 +287,8 @@ def check_status(job_id):
 
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
+    cleanup_expired_downloads()
+
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404

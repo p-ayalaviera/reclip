@@ -25,4 +25,4 @@ ENV PATH=/home/reclip/.local/bin:$PATH
 EXPOSE 8899
 
 ENTRYPOINT ["sh", "/app/docker-entrypoint.sh"]
-CMD ["gunicorn", "-b", "0.0.0.0:8899", "-w", "1", "--threads", "4", "--timeout", "600", "--access-logfile", "-", "app:app"]
+CMD ["sh", "-c", "exec gunicorn -b 0.0.0.0:${PORT:-8899} -w 1 --threads 4 --timeout 600 --access-logfile - app:app"]

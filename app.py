@@ -23,6 +23,30 @@ except ValueError:
 if DOWNLOAD_TTL_SECONDS <= 0:
     DOWNLOAD_TTL_SECONDS = 3600
 
+# Cloud datacenter IPs (Railway included) sometimes get HTTP 403 from
+# YouTube's web-client bot-detection. The Android/iOS clients use a
+# different auth flow that is often unaffected, but they also expose fewer
+# quality options — so this is only used as a fallback, not the default,
+# to avoid capping every download at a low resolution. No account/cookies
+# involved.
+YTDLP_FALLBACK_CLIENT_ARGS = ["--extractor-args", "youtube:player_client=android,ios"]
+YTDLP_BLOCK_MARKERS = ("HTTP Error 403", "Sign in to confirm")
+
+
+def run_ytdlp(cmd, timeout):
+    """Run a yt-dlp command, retrying with mobile clients if YouTube blocks it."""
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+    if result.returncode != 0 and any(marker in result.stderr for marker in YTDLP_BLOCK_MARKERS):
+        fallback = subprocess.run(
+            cmd + YTDLP_FALLBACK_CLIENT_ARGS, capture_output=True, text=True, timeout=timeout
+        )
+        if fallback.returncode == 0:
+            return fallback
+
+    return result
+
+
 jobs = {}
 
 
@@ -127,7 +151,7 @@ def run_download(job_id, url, format_choice, format_id):
     cmd.append(url)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = run_ytdlp(cmd, timeout=300)
         if result.returncode != 0:
             job["status"] = "error"
             job["error"] = result.stderr.strip().split("\n")[-1]
@@ -185,7 +209,7 @@ def get_info():
 
     cmd = ["yt-dlp", "--no-playlist", "-j", url]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = run_ytdlp(cmd, timeout=60)
         if result.returncode != 0:
             return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
 
@@ -231,7 +255,7 @@ def get_playlist_info():
 
     cmd = ["yt-dlp", "--flat-playlist", "-J", url]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = run_ytdlp(cmd, timeout=60)
         if result.returncode != 0:
             return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
 
